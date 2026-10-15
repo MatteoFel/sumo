@@ -161,3 +161,6 @@ meso_event_order
 
 # meso-ltm keeps the gap times of its queues and the unqueued event times of vehicles when loading state (#18364)
 meso_ltm_queue_state
+
+# vehicles waiting for insertion do not repeat their pre-insertion reroute after loading state (#18366)
+preinsertion_reroute
