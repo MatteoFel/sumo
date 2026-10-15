@@ -645,7 +645,7 @@ MESegment::getTauJJ(double nextQueueSize, double nextQueueCapacity, double nextJ
 
 bool
 MESegment::overtake() {
-    return myOvertaking && RandHelper::rand() > (getBruttoOccupancy() / myCapacity);
+    return myOvertaking && RandHelper::rand(myRNG) > (getBruttoOccupancy() / myCapacity);
 }
 
 

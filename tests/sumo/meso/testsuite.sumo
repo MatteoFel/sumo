@@ -32,3 +32,6 @@ lane_queue
 # ignoring lanes by vclass
 ignore_lanes
 bugs
+
+# computing the events of junction groups in parallel (--meso-threads)
+parallel

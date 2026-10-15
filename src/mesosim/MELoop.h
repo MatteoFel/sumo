@@ -24,6 +24,10 @@
 #include <queue>
 #include <map>
 #include <utils/common/SUMOTime.h>
+#include <utils/common/RandHelper.h>
+#ifdef HAVE_FOX
+#include <utils/foxtools/MFXWorkerThread.h>
+#endif
 #include <microsim/MSMoveReminder.h>
 
 
@@ -36,6 +40,7 @@ class MSEdge;
 class MSLink;
 class MSVehicleControl;
 class OptionsCont;
+class OutputDevice;
 
 // ===========================================================================
 // class definitions
@@ -112,15 +117,29 @@ public:
     /** @brief Remove all vehicles before quick-loading state */
     void clearState();
 
+    /** @brief Split the network into groups whose events are processed in parallel (option --meso-threads)
+     *
+     * Every edge belongs to the group of the junction it ends at, so all vehicles which want
+     *  to pass a junction or enter an edge are handled by the same group.
+     */
+    void buildGroups(const OptionsCont& oc);
+
+    /// @brief save / load the states of the random number generators of the groups
+    void saveRNGStates(OutputDevice& out);
+    void loadRNGState(int index, const std::string& state);
+
 private:
     /** @brief Check whether the vehicle may move
      *
      * This method is called when the vehicle reaches its event time and checks
      *  whether it may proceed to the next segment.
+     * When called for a group (see buildGroups), moves into the segment of another group
+     *  and teleports are deferred to the end of the simulation step.
      *
      * @param[in] veh The vehicle to check
+     * @param[in] group The group processing the event or -1
      */
-    void checkCar(MEVehicle* veh);
+    void checkCar(MEVehicle* veh, const int group = -1);
 
     /** @brief Retrieve next segment
      *
@@ -146,6 +165,7 @@ private:
 
     struct LeaderEvent {
         LeaderEvent(MEVehicle* v);
+        LeaderEvent(MEVehicle* v, long long int index);
 
         SUMOTime time;
         // eventIndex ensures stable sorting of vehicles with the same event time
@@ -168,14 +188,57 @@ private:
         static long long int myEventCounter;
     };
 
-    /// @brief check whether the current car was invalidated and remove it from myInvalidatedLeaderCars
-    bool wasInvalidated(const LeaderEvent& e);
-
-
     /// @brief leader cars in the segments sorted by exit time
     typedef std::priority_queue<LeaderEvent> LeaderEventQeue;
     LeaderEventQeue myLeaderCars;
     LeaderEventQeue myInvalidatedLeaderCars;
+
+    /// @brief check whether the current car was invalidated and remove it from the invalidated cars
+    static bool wasInvalidated(const LeaderEvent& e, LeaderEventQeue& invalidated);
+
+    /// @brief check all cars with an event time up to tMax (group -1 for the queues without groups)
+    void processEvents(LeaderEventQeue& leaders, LeaderEventQeue& invalidated, SUMOTime tMax, const int group);
+
+    /// @brief the group whose queue holds the event of the given car
+    int getGroup(const MEVehicle* veh) const;
+
+    /// @brief a set of junctions with the edges ending there, see buildGroups
+    struct Group {
+        Group(const std::string& id) : rng(id) {}
+        LeaderEventQeue leaders;
+        LeaderEventQeue invalidated;
+        long long int eventCounter = 0;
+        SumoRNG rng;
+        /// @brief cars which enter the segment of another group or teleport at the end of the step
+        std::vector<MEVehicle*> deferred;
+    };
+    std::vector<Group> myGroups;
+
+    /// @brief the group of each edge by numerical id
+    std::vector<int> myEdgeGroups;
+
+    /// @brief the end of the current simulation step
+    SUMOTime myStepEnd = 0;
+
+#ifdef HAVE_FOX
+    /// @brief the task processing the events of one group
+    class GroupTask : public MFXWorkerThread::Task {
+    public:
+        GroupTask(MELoop& loop, int group) : myLoop(loop), myGroup(group) {}
+        void run(MFXWorkerThread* /*context*/) {
+            Group& g = myLoop.myGroups[myGroup];
+            myLoop.processEvents(g.leaders, g.invalidated, myLoop.myStepEnd, myGroup);
+        }
+    private:
+        MELoop& myLoop;
+        const int myGroup;
+    private:
+        /// @brief Invalidated assignment operator.
+        GroupTask& operator=(const GroupTask&) = delete;
+    };
+    std::vector<GroupTask*> myGroupTasks;
+    MFXWorkerThread::Pool myThreadPool;
+#endif
 
     /// @brief ranks of the pending events by numerical vehicle id (computed once per saving step)
     mutable std::map<long long int, long long int> myEventIndexCache;

@@ -149,6 +149,15 @@ The following parameters are used by the model:
 !!! note
     The meso-LTM model achieves more realistic simulation for urban queuing dynamics. The original meso model (Eissfeldt) achieves instant propagation of gaps when queued traffic starts to flow again (i.e. at a traffic light). In contrast, the meso-LTM model distinguishes between a queue that has space at the upstream end and a queue that has space ad the downstream end.
 
+## Parallel simulation
+
+With option **--meso-threads N**, the mesoscopic events are computed by N threads. The network is split into **--meso-threads.groups** groups of junctions (default 32) and every edge belongs to the group of the junction where it ends, so all vehicles which want to pass a junction or enter an edge are handled by the same group. In every simulation step, the groups process their events in parallel. Vehicles which enter an edge of another group, and all teleports, are processed at the end of the step in the order of their event times. Each group uses its own random number generator.
+
+The results depend on the number of groups but not on the number of threads. They differ slightly from the results without **--meso-threads** because moves between groups wait until the end of the step (edges which can be passed within one step therefore never connect different groups). Saving and loading the state reproduces the results of a continuous run.
+
+!!! note
+    The parallel computation is meant for **--meso-ltm**, where jams travel upstream at a limited speed. Stops, parking, rerouters, calibrators, TraCI, persons and rail have not been tested with **--meso-threads** yet.
+
 ## Lateral Model
 
 Lateral movement is not modelled explicitly. Vehicles may overtake each

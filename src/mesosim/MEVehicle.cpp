@@ -215,7 +215,7 @@ MEVehicle::setApproaching(MSLink* link) {
     if (link != nullptr) {
         const double speed = getSpeed();
         link->setApproaching(this, getEventTime() + (link->getState() == LINKSTATE_ALLWAY_STOP ?
-                             (SUMOTime)RandHelper::rand((int)2) : 0), // tie braker
+                             (SUMOTime)RandHelper::rand((int)2, mySegment != nullptr ? mySegment->getRNG() : nullptr) : 0), // tie braker
                              speed, link->getViaLaneOrLane()->getVehicleMaxSpeed(this), true,
                              speed, getWaitingTime(),
                              // @note: dist is not used by meso (getZipperSpeed is never called)

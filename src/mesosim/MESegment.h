@@ -33,6 +33,7 @@
 // ===========================================================================
 class SUMOVehicle;
 class MSEdge;
+class SumoRNG;
 class MSLink;
 class MSDetectorFileOutput;
 class MSVehicleControl;
@@ -197,6 +198,18 @@ public:
 
     /// @brief update entry blockTime for all queues
     virtual void updateEntryBlockTime(SUMOTime /*time*/) {}
+
+    /// @brief the group for parallel event computation (see MELoop) and its random number generator
+    int getGroup() const {
+        return myGroup;
+    }
+    SumoRNG* getRNG() const {
+        return myRNG;
+    }
+    void setGroup(int group, SumoRNG* rng) {
+        myGroup = group;
+        myRNG = rng;
+    }
 
     /// @brief model specific queue state (e.g. the gap times of meso-ltm) for saving / loading
     virtual std::string getQueueExtraState(int /*qIdx*/) const {
@@ -571,6 +584,10 @@ protected:
 
     /// @brief The time headway parameters, see the Eissfeldt thesis
     SUMOTime myTau_ff, myTau_fj, myTau_jf, myTau_jj;
+
+    /// @brief group for parallel event computation (see MELoop) and its random number generator
+    int myGroup = 0;
+    SumoRNG* myRNG = nullptr;
 
     /// @brief Whether tls penalty is enabled
     bool myTLSPenalty;
