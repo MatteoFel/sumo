@@ -769,6 +769,14 @@ MSFrame::fillOptions() {
     oc.addDescription("mesosim", "Mesoscopic", TL("Enables mesoscopic simulation"));
     oc.doRegister("meso-ltm", new Option_Bool(false));
     oc.addDescription("meso-ltm", "Mesoscopic", TL("Enables the meso-LTM (LIFT) model"));
+    oc.doRegister("meso-threads", new Option_Integer(0));
+    oc.addDescription("meso-threads", "Mesoscopic", TL("Number of threads for computing meso events in parallel, one second at a time (0 disables)"));
+    oc.doRegister("meso-threads.groups", new Option_Integer(0));
+    oc.addDescription("meso-threads.groups", "Mesoscopic", TL("Number of edge groups for parallel meso events (default: 4 per thread)"));
+    oc.doRegister("meso-threads.rounds", new Option_Integer(1));
+    oc.addDescription("meso-threads.rounds", "Mesoscopic", TL("Maximum number of parallel rounds per step for events that become due during the step"));
+    oc.doRegister("meso-threads.min-cut-time", new Option_String("1", "TIME"));
+    oc.addDescription("meso-threads.min-cut-time", "Mesoscopic", TL("Edges that can be entered and left within this time always stay in one group"));
     oc.doRegister("meso-edgelength", new Option_Float(98.0f));
     oc.addDescription("meso-edgelength", "Mesoscopic", TL("Length of an edge segment in mesoscopic simulation"));
     oc.doRegister("meso-tauff", new Option_String("1.13", "TIME"));

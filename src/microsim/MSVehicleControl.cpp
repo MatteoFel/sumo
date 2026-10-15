@@ -63,7 +63,7 @@ MSVehicleControl::MSVehicleControl() :
     myMinDeceleration(SUMOVTypeParameter::getDefaultDecel(SVC_IGNORING)),
     myMinDecelerationRail(SUMOVTypeParameter::getDefaultDecel(SVC_RAIL)),
     myMaxMinGap(0),
-    myPendingRemovals(MSGlobals::gNumSimThreads > 1) {
+    myPendingRemovals(MSGlobals::gNumSimThreads > 1 || (OptionsCont::getOptions().exists("meso-threads") && OptionsCont::getOptions().getInt("meso-threads") > 0)) {
 
     initDefaultTypes();
     myScale = OptionsCont::getOptions().getFloat("scale");

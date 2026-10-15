@@ -39,6 +39,7 @@
     <xsd:complexType name="rngStateType">
         <xsd:choice maxOccurs="unbounded">
             <xsd:element name="rngLane" type="rngLaneType" minOccurs="0"/>
+            <xsd:element name="rngMesoGroup" type="rngLaneType" minOccurs="0"/>
         </xsd:choice>
         <xsd:attribute name="default" type="xsd:string" use="required"/>
         <xsd:attribute name="routeHandler" type="xsd:string" use="optional"/>

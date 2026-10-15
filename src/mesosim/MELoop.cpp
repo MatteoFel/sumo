@@ -24,6 +24,15 @@
 #include <algorithm>
 #include <map>
 #include <cmath>
+#include <limits>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <iostream>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 
 #include <microsim/MSNet.h>
 #include <microsim/MSEdge.h>
@@ -31,6 +40,9 @@
 #include <microsim/MSLane.h>
 #include <microsim/MSVehicle.h>
 #include <microsim/MSVehicleControl.h>
+#include <microsim/MSJunction.h>
+#include <utils/common/MsgHandler.h>
+#include <utils/iodevices/OutputDevice.h>
 #include <utils/options/OptionsCont.h>
 #include <utils/common/ToString.h>
 #include <utils/common/FileHelpers.h>
@@ -43,6 +55,83 @@
 
 long long int MELoop::LeaderEvent::myEventCounter(0);
 
+
+// ===========================================================================
+// MELoop::WorkerPool: runs a task for the indices 0..n-1 on all threads and waits
+// ===========================================================================
+class MELoop::WorkerPool {
+public:
+    WorkerPool(int numThreads) {
+        for (int i = 1; i < numThreads; i++) {
+            myThreads.emplace_back([this] { work(); });
+        }
+    }
+
+    ~WorkerPool() {
+        {
+            std::lock_guard<std::mutex> lock(myMutex);
+            myStop = true;
+            myGeneration++;
+        }
+        myWake.notify_all();
+        for (std::thread& t : myThreads) {
+            t.join();
+        }
+    }
+
+    void run(int count, const std::function<void(int)>& task) {
+        {
+            std::lock_guard<std::mutex> lock(myMutex);
+            myTask = &task;
+            myCount = count;
+            myNext = 0;
+            myActive = (int)myThreads.size();
+            myGeneration++;
+        }
+        myWake.notify_all();
+        execute();
+        std::unique_lock<std::mutex> lock(myMutex);
+        myDone.wait(lock, [this] { return myActive == 0; });
+    }
+
+private:
+    void execute() {
+        for (int i = myNext.fetch_add(1); i < myCount; i = myNext.fetch_add(1)) {
+            (*myTask)(i);
+        }
+    }
+
+    void work() {
+        unsigned long long seen = 0;
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lock(myMutex);
+                myWake.wait(lock, [this, seen] { return myGeneration != seen; });
+                seen = myGeneration;
+                if (myStop) {
+                    return;
+                }
+            }
+            execute();
+            std::lock_guard<std::mutex> lock(myMutex);
+            if (--myActive == 0) {
+                myDone.notify_one();
+            }
+        }
+    }
+
+    std::vector<std::thread> myThreads;
+    std::mutex myMutex;
+    std::condition_variable myWake;
+    std::condition_variable myDone;
+    std::atomic<int> myNext{0};
+    int myCount = 0;
+    int myActive = 0;
+    const std::function<void(int)>* myTask = nullptr;
+    unsigned long long myGeneration = 0;
+    bool myStop = false;
+};
+
 // ===========================================================================
 // method definitions
 // ===========================================================================
@@ -50,6 +139,20 @@ MELoop::MELoop(const SUMOTime recheckInterval) : myFullRecheckInterval(recheckIn
 }
 
 MELoop::~MELoop() {
+    if (myThreads > 0 && myVerbose) {
+        long long int events = 0;
+        double busy = 0;
+        for (const Group& g : myGroups) {
+            events += g.events;
+            busy += g.busy;
+        }
+        std::cout << "Parallel meso: " << myRoundCount << " rounds, " << events << " events, " << myDeferredCount
+                  << " deferred, parallel part " << myParallelTime << "s (group work " << busy << "s), serial part " << mySerialTime << "s\n";
+    }
+    delete myWorkerPool;
+    for (Group& g : myGroups) {
+        delete g.rng;
+    }
     for (std::vector<MESegment*>::const_iterator j = myEdges2FirstSegments.begin(); j != myEdges2FirstSegments.end(); ++j) {
         for (MESegment* s = *j; s != nullptr;) {
             MESegment* n = s->getNextSegment();
@@ -62,48 +165,107 @@ MELoop::~MELoop() {
 
 void
 MELoop::simulate(SUMOTime tMax) {
-    while (!myLeaderCars.empty()) {
-        LeaderEvent e = myLeaderCars.top();
-        assert(e.time > tMax - DELTA_T);
+    if (!myGroupsInitialized) {
+        initGroups();
+    }
+    myStepEnd = tMax;
+    if (myThreads <= 0) {
+        processEvents(myLeaderCars, myInvalidatedLeaderCars, tMax, -1);
+        return;
+    }
+    const std::function<void(int)> task = [this, tMax](int i) {
+        const auto start = std::chrono::steady_clock::now();
+        processEvents(myGroups[i].leaders, myGroups[i].invalidated, tMax, i);
+        myGroups[i].busy += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    };
+    for (int round = 0; round < myRounds; round++) {
+        bool due = false;
+        for (const Group& g : myGroups) {
+            if (!g.leaders.empty() && g.leaders.top().time <= tMax) {
+                due = true;
+                break;
+            }
+        }
+        if (!due) {
+            break;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        myWorkerPool->run((int)myGroups.size(), task);
+        const auto t1 = std::chrono::steady_clock::now();
+        myParallelTime += std::chrono::duration<double>(t1 - t0).count();
+        myRoundCount++;
+        // serial part: moves into other groups and teleports, in time order
+        std::vector<MEVehicle*> deferred;
+        for (Group& g : myGroups) {
+            deferred.insert(deferred.end(), g.deferred.begin(), g.deferred.end());
+            g.deferred.clear();
+        }
+        std::sort(deferred.begin(), deferred.end(), [](const MEVehicle * a, const MEVehicle * b) {
+            return a->getEventTime() < b->getEventTime() || (a->getEventTime() == b->getEventTime() && a->getNumericalID() < b->getNumericalID());
+        });
+        for (MEVehicle* veh : deferred) {
+            veh->setDeferred(false);
+            // the vehicle may have been overtaken in the meantime and then waits for its next turn as leader
+            MESegment* const seg = veh->getSegment();
+            if (seg != nullptr && veh->getQueIndex() != MESegment::PARKING_QUEUE
+                    && (seg->getQueue(veh->getQueIndex()).empty() || seg->getQueue(veh->getQueIndex()).back() != veh)) {
+                continue;
+            }
+            checkCar(veh, -1);
+        }
+        myDeferredCount += (long long int)deferred.size();
+        mySerialTime += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+    }
+}
+
+
+void
+MELoop::processEvents(LeaderEventQeue& leaders, LeaderEventQeue& invalidated, SUMOTime tMax, const int group) {
+    while (!leaders.empty()) {
+        LeaderEvent e = leaders.top();
+        assert(group >= 0 || e.time > tMax - DELTA_T);
         if (e.time > tMax) {
             return;
         }
-        myLeaderCars.pop();
-        while (!myInvalidatedLeaderCars.empty() && e.time > myInvalidatedLeaderCars.top().time) {
-            myInvalidatedLeaderCars.pop();
+        leaders.pop();
+        while (!invalidated.empty() && e.time > invalidated.top().time) {
+            invalidated.pop();
         }
-        if (!myInvalidatedLeaderCars.empty()) {
-            if (wasInvalidated(e)) {
+        if (!invalidated.empty()) {
+            if (wasInvalidated(e, invalidated)) {
                 continue;
             }
         }
         //std::cout << SIMTIME << " checkChar " << e.veh->getID() << " on=" << e.veh->getSegment()->getID() << " t=" << e.time << " nid=" << e.veh->getNumericalID() << "\n";
-        checkCar(e.veh);
-        assert(myLeaderCars.empty() || myLeaderCars.top().time >= e.time);
+        if (group >= 0) {
+            myGroups[group].events++;
+        }
+        checkCar(e.veh, group);
+        assert(leaders.empty() || leaders.top().time >= e.time);
     }
 }
 
 
 bool
-MELoop::wasInvalidated(const LeaderEvent& e) {
-    if (e.time == myInvalidatedLeaderCars.top().time) {
+MELoop::wasInvalidated(const LeaderEvent& e, LeaderEventQeue& invalidated) {
+    if (e.time == invalidated.top().time) {
         // we need to check whether any of the events with the same time
         // is our current vehicle because the order in which
         // removeLeaderCar was called is unrelated to the order of addLeaderCar
         std::vector<LeaderEvent> tmp;
         bool curInvalid = false;
-        while (!myInvalidatedLeaderCars.empty() && e.time == myInvalidatedLeaderCars.top().time) {
-            if (e == myInvalidatedLeaderCars.top()) {
-                myInvalidatedLeaderCars.pop();
+        while (!invalidated.empty() && e.time == invalidated.top().time) {
+            if (e == invalidated.top()) {
+                invalidated.pop();
                 curInvalid = true;
                 break;
             } else {
-                tmp.push_back(myInvalidatedLeaderCars.top());
-                myInvalidatedLeaderCars.pop();
+                tmp.push_back(invalidated.top());
+                invalidated.pop();
             }
         }
         for (LeaderEvent& le : tmp) {
-            myInvalidatedLeaderCars.push(le);
+            invalidated.push(le);
         }
         return curInvalid;
     }
@@ -184,11 +346,17 @@ MELoop::changeSegment(MEVehicle* veh, SUMOTime leaveTime, MESegment* const toSeg
 
 
 void
-MELoop::checkCar(MEVehicle* veh) {
+MELoop::checkCar(MEVehicle* veh, const int group) {
     const SUMOTime leaveTime = veh->getEventTime();
     MESegment* const onSegment = veh->getSegment();
     MESegment* const toSegment = veh->getQueIndex() == MESegment::PARKING_QUEUE ? onSegment : nextSegment(onSegment, veh);
     const bool teleporting = (onSegment == nullptr); // is the vehicle currently teleporting?
+    if (group >= 0 && (teleporting || (!MESegment::isInvalid(toSegment) && toSegment->getGroup() != group))) {
+        // entering another group's segment is decided in the serial part of the step
+        veh->setDeferred(true);
+        myGroups[group].deferred.push_back(veh);
+        return;
+    }
     // @note reason is only evaluated if toSegment == nullptr
     const SUMOTime nextEntry = changeSegment(veh, leaveTime, toSegment, MSMoveReminder::NOTIFICATION_ARRIVED, teleporting);
     if (nextEntry == leaveTime) {
@@ -202,6 +370,11 @@ MELoop::checkCar(MEVehicle* veh) {
                                    && veh->succEdge(1) != nullptr
                                    && veh->getEdge()->allowedLanes(*veh->succEdge(1), veh->getVClass()) == nullptr);
         if ((r1 && !disconnected) || (r3 && disconnected)) {
+            if (group >= 0) {
+                veh->setDeferred(true);
+                myGroups[group].deferred.push_back(veh);
+                return;
+            }
             teleportVehicle(veh, toSegment, disconnected);
             return;
         }
@@ -213,6 +386,10 @@ MELoop::checkCar(MEVehicle* veh) {
     if (nextEntry == SUMOTime_MAX) {
         // all usable queues on the next segment are full
         SUMOTime newEventTime = MAX3(toSegment->getEventTime() + 1, leaveTime + 1, leaveTime + myFullRecheckInterval);
+        if (group >= 0 && toSegment->getEventTime() < leaveTime) {
+            // the vehicle blocking the next segment waits for the serial part of this step
+            newEventTime = MAX2(newEventTime, myStepEnd + 1);
+        }
         if (ttt) {
             // if teleporting is enabled, make sure we look at the vehicle when the gridlock-time is up
             const SUMOTime recheck = veh->getBlockTime() + 1 + ttt;
@@ -300,14 +477,29 @@ MELoop::teleportVehicle(MEVehicle* veh, MESegment* const toSegment, bool disconn
 
 void
 MELoop::addLeaderCar(MEVehicle* veh, MSLink* link) {
-    LeaderEvent e(veh);
-    if (veh->getLoadedEventIndex() >= 0) {
-        // restore the order of simultaneous events from the loaded state
-        e.eventIndex = veh->getLoadedEventIndex();
-        veh->setLoadedEventIndex(-1);
-        LeaderEvent::myEventCounter = MAX2(LeaderEvent::myEventCounter, e.eventIndex + 1);
+    if (!myGroupsInitialized) {
+        initGroups();
     }
-    myLeaderCars.push(e);
+    const long long int loaded = veh->getLoadedEventIndex();
+    veh->setLoadedEventIndex(-1);
+    if (myThreads > 0) {
+        Group& g = myGroups[getGroup(veh)];
+        if (loaded >= 0) {
+            // restore the order of simultaneous events from the loaded state
+            g.leaders.push(LeaderEvent(veh, loaded));
+            g.eventCounter = MAX2(g.eventCounter, loaded + 1);
+        } else {
+            g.leaders.push(LeaderEvent(veh, g.eventCounter++));
+        }
+    } else {
+        LeaderEvent e(veh);
+        if (loaded >= 0) {
+            // restore the order of simultaneous events from the loaded state
+            e.eventIndex = loaded;
+            LeaderEvent::myEventCounter = MAX2(LeaderEvent::myEventCounter, e.eventIndex + 1);
+        }
+        myLeaderCars.push(e);
+    }
     veh->setApproaching(link);
 }
 
@@ -316,6 +508,11 @@ void
 MELoop::clearState() {
     myLeaderCars = LeaderEventQeue();
     myInvalidatedLeaderCars = LeaderEventQeue();
+    for (Group& g : myGroups) {
+        g.leaders = LeaderEventQeue();
+        g.invalidated = LeaderEventQeue();
+        g.deferred.clear();
+    }
 }
 
 
@@ -323,24 +520,31 @@ long long int
 MELoop::getEventIndex(const MEVehicle* veh) const {
     if (myEventIndexCacheTime != SIMSTEP) {
         myEventIndexCache.clear();
-        std::map<std::pair<SUMOTime, long long int>, int> invalid;
-        for (LeaderEventQeue inv = myInvalidatedLeaderCars; !inv.empty(); inv.pop()) {
-            invalid[std::make_pair(inv.top().time, inv.top().nid)]++;
-        }
-        std::vector<std::pair<long long int, long long int> > pending;
-        for (LeaderEventQeue q = myLeaderCars; !q.empty(); q.pop()) {
-            const LeaderEvent& e = q.top();
-            auto it = invalid.find(std::make_pair(e.time, e.nid));
-            if (it != invalid.end() && it->second > 0) {
-                it->second--;
-                continue;
+        // the ranks refer to the event queue holding the event (the serial one or the one of a parallel group)
+        auto rank = [this](const LeaderEventQeue & leaders, const LeaderEventQeue & invalidated) {
+            std::map<std::pair<SUMOTime, long long int>, int> invalid;
+            for (LeaderEventQeue inv = invalidated; !inv.empty(); inv.pop()) {
+                invalid[std::make_pair(inv.top().time, inv.top().nid)]++;
             }
-            pending.push_back(std::make_pair(e.eventIndex, e.nid));
-        }
-        // save ranks instead of the indices so that the values do not depend on the number of events processed before
-        std::sort(pending.begin(), pending.end());
-        for (int i = 0; i < (int)pending.size(); i++) {
-            myEventIndexCache[pending[i].second] = i;
+            std::vector<std::pair<long long int, long long int> > pending;
+            for (LeaderEventQeue q = leaders; !q.empty(); q.pop()) {
+                const LeaderEvent& e = q.top();
+                auto it = invalid.find(std::make_pair(e.time, e.nid));
+                if (it != invalid.end() && it->second > 0) {
+                    it->second--;
+                    continue;
+                }
+                pending.push_back(std::make_pair(e.eventIndex, e.nid));
+            }
+            // save ranks instead of the indices so that the values do not depend on the number of events processed before
+            std::sort(pending.begin(), pending.end());
+            for (int i = 0; i < (int)pending.size(); i++) {
+                myEventIndexCache[pending[i].second] = i;
+            }
+        };
+        rank(myLeaderCars, myInvalidatedLeaderCars);
+        for (const Group& g : myGroups) {
+            rank(g.leaders, g.invalidated);
         }
         myEventIndexCacheTime = SIMSTEP;
     }
@@ -351,7 +555,189 @@ MELoop::getEventIndex(const MEVehicle* veh) const {
 
 void
 MELoop::removeLeaderCar(MEVehicle* v) {
-    myInvalidatedLeaderCars.push(LeaderEvent(v));
+    if (myThreads > 0) {
+        if (!v->isDeferred()) {
+            // a deferred vehicle has no pending event that could be invalidated
+            myGroups[getGroup(v)].invalidated.push(LeaderEvent(v, 0));
+        }
+    } else {
+        myInvalidatedLeaderCars.push(LeaderEvent(v));
+    }
+}
+
+
+int
+MELoop::getGroup(const MEVehicle* veh) const {
+    const MESegment* const seg = veh->getSegment();
+    if (seg != nullptr && !MESegment::isInvalid(seg)) {
+        return seg->getGroup();
+    }
+    return myEdgeGroups[veh->getEdge()->getNumericalID()];
+}
+
+
+void
+MELoop::initGroups() {
+    myGroupsInitialized = true;
+    const OptionsCont& oc = OptionsCont::getOptions();
+    myThreads = oc.getInt("meso-threads");
+    if (myThreads <= 0) {
+        return;
+    }
+    myVerbose = oc.getBool("verbose");
+    myRounds = MAX2(1, oc.getInt("meso-threads.rounds"));
+    int numGroups = oc.getInt("meso-threads.groups");
+    if (numGroups <= 0) {
+        numGroups = 4 * myThreads;
+    }
+    const double minCutTime = STEPS2TIME(string2time(oc.getString("meso-threads.min-cut-time")));
+    // union-find over junctions: an edge belongs to the group of its end junction;
+    // edges that can be crossed within minCutTime keep both of their junctions in one group
+    std::unordered_map<const MSJunction*, int> index;
+    std::vector<const MSJunction*> junctions;
+    std::vector<int> parent;
+    auto id = [&](const MSJunction * j) {
+        auto it = index.find(j);
+        if (it != index.end()) {
+            return it->second;
+        }
+        index[j] = (int)junctions.size();
+        junctions.push_back(j);
+        parent.push_back((int)parent.size());
+        return (int)parent.size() - 1;
+    };
+    auto find = [&](int i) {
+        while (parent[i] != i) {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        return i;
+    };
+    auto firstSegment = [this](const MSEdge * e) -> const MESegment* {
+        return e->getNumericalID() < (int)myEdges2FirstSegments.size() ? myEdges2FirstSegments[e->getNumericalID()] : nullptr;
+    };
+    int numSegments = 0;
+    for (const MSEdge* e : MSEdge::getAllEdges()) {
+        const MESegment* first = firstSegment(e);
+        if (first == nullptr || e->getFromJunction() == nullptr || e->getToJunction() == nullptr) {
+            continue;
+        }
+        for (const MESegment* s = first; s != nullptr; s = s->getNextSegment()) {
+            numSegments++;
+        }
+        const int from = find(id(e->getFromJunction()));
+        const int to = find(id(e->getToJunction()));
+        // vehicles may drive faster than the speed limit (speedFactor)
+        const double fastest = 1.3 * MAX2(e->getSpeedLimit(), NUMERICAL_EPS);
+        if (from != to && (!e->isNormal() || first->getLength() < fastest * minCutTime)) {
+            parent[from] = to;
+        }
+    }
+    // clusters of junctions ordered along a Z-order curve, then cut into groups with a similar number of segments
+    struct Cluster {
+        double x = 0, y = 0, weight = 0;
+        int count = 0, group = 0;
+    };
+    std::map<int, Cluster> clusters;
+    for (const MSEdge* e : MSEdge::getAllEdges()) {
+        if (firstSegment(e) != nullptr && e->getToJunction() != nullptr) {
+            Cluster& c = clusters[find(id(e->getToJunction()))];
+            for (const MESegment* s = firstSegment(e); s != nullptr; s = s->getNextSegment()) {
+                c.weight += 1;
+            }
+        }
+    }
+    double xmin = std::numeric_limits<double>::max(), ymin = xmin, xmax = -xmin, ymax = -xmin;
+    for (int i = 0; i < (int)junctions.size(); i++) {
+        const Position& p = junctions[i]->getPosition();
+        Cluster& c = clusters[find(i)];
+        c.x += p.x();
+        c.y += p.y();
+        c.count++;
+        xmin = MIN2(xmin, p.x());
+        ymin = MIN2(ymin, p.y());
+        xmax = MAX2(xmax, p.x());
+        ymax = MAX2(ymax, p.y());
+    }
+    std::vector<std::pair<unsigned long long, int> > order;
+    double total = 0;
+    double largest = 0;
+    for (auto& item : clusters) {
+        const Cluster& c = item.second;
+        const unsigned int ix = (unsigned int)(65535 * (c.x / c.count - xmin) / MAX2(xmax - xmin, 1.));
+        const unsigned int iy = (unsigned int)(65535 * (c.y / c.count - ymin) / MAX2(ymax - ymin, 1.));
+        unsigned long long key = 0;
+        for (int b = 0; b < 16; b++) {
+            key |= ((unsigned long long)((ix >> b) & 1) << (2 * b)) | ((unsigned long long)((iy >> b) & 1) << (2 * b + 1));
+        }
+        order.push_back(std::make_pair(key, item.first));
+        total += c.weight;
+        largest = MAX2(largest, c.weight);
+    }
+    std::sort(order.begin(), order.end());
+    double cumulated = 0;
+    for (const auto& item : order) {
+        Cluster& c = clusters[item.second];
+        c.group = MIN2(numGroups - 1, (int)(cumulated * numGroups / MAX2(total, 1.)));
+        cumulated += c.weight;
+    }
+    myGroups.resize(numGroups);
+    for (int i = 0; i < numGroups; i++) {
+        myGroups[i].rng = new SumoRNG("meso-group-" + toString(i));
+        myGroups[i].rng->setSeed(RandHelper::getSeed() + i);
+    }
+    myEdgeGroups.assign(MSEdge::getAllEdges().size(), 0);
+    int cutEdges = 0;
+    int edges = 0;
+    for (const MSEdge* e : MSEdge::getAllEdges()) {
+        const MSJunction* end = e->getToJunction() != nullptr ? e->getToJunction() : e->getFromJunction();
+        if (end == nullptr) {
+            continue;
+        }
+        const int group = clusters[find(id(end))].group;
+        myEdgeGroups[e->getNumericalID()] = group;
+        if (firstSegment(e) != nullptr) {
+            for (MESegment* s = myEdges2FirstSegments[e->getNumericalID()]; s != nullptr; s = s->getNextSegment()) {
+                s->setGroup(group, myGroups[group].rng);
+            }
+            if (e->getFromJunction() != nullptr) {
+                edges++;
+                if (clusters[find(id(e->getFromJunction()))].group != group) {
+                    cutEdges++;
+                }
+            }
+        }
+    }
+    WRITE_MESSAGEF(TL("Parallel meso: % threads, % groups from % junction clusters (largest % of % segments), % of % edges cross groups."),
+                   toString(myThreads), toString(numGroups), toString(clusters.size()), toString(largest), toString(numSegments), toString(cutEdges), toString(edges));
+    myWorkerPool = new WorkerPool(myThreads);
+}
+
+
+void
+MELoop::saveRNGStates(OutputDevice& out) {
+    if (!myGroupsInitialized) {
+        initGroups();
+    }
+    for (int i = 0; i < (int)myGroups.size(); i++) {
+        out.openTag(SUMO_TAG_RNGMESOGROUP);
+        out.writeAttr(SUMO_ATTR_INDEX, i);
+        out.writeAttr(SUMO_ATTR_STATE, RandHelper::saveState(myGroups[i].rng));
+        out.closeTag();
+    }
+}
+
+
+void
+MELoop::loadRNGState(int index, const std::string& state) {
+    if (!myGroupsInitialized) {
+        initGroups();
+    }
+    if (index < (int)myGroups.size()) {
+        RandHelper::loadState(state, myGroups[index].rng);
+    } else {
+        WRITE_WARNINGF(TL("Ignoring random number state of meso group % (the simulation uses % groups)."), toString(index), toString(myGroups.size()));
+    }
 }
 
 
@@ -454,6 +840,13 @@ MELoop::isEnteringRoundabout(const MSEdge& e) {
     }
     return false;
 }
+
+
+MELoop::LeaderEvent::LeaderEvent(MEVehicle* v, long long int index):
+    time(v->getEventTime()),
+    eventIndex(index),
+    nid(v->getNumericalID()),
+    veh(v) { }
 
 
 MELoop::LeaderEvent::LeaderEvent(MEVehicle* v):

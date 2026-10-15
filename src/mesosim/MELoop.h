@@ -36,6 +36,8 @@ class MSEdge;
 class MSLink;
 class MSVehicleControl;
 class OptionsCont;
+class OutputDevice;
+class SumoRNG;
 
 // ===========================================================================
 // class definitions
@@ -112,15 +114,34 @@ public:
     /** @brief Remove all vehicles before quick-loading state */
     void clearState();
 
+    /// @brief save / load the random number generators of the parallel groups (see --meso-threads)
+    void saveRNGStates(OutputDevice& out);
+    void loadRNGState(int index, const std::string& state);
+
 private:
+    struct LeaderEvent;
+    typedef std::priority_queue<LeaderEvent> LeaderEventQeue;
+
+    /// @brief process all events up to tMax from the given queues (group < 0: serial)
+    void processEvents(LeaderEventQeue& leaders, LeaderEventQeue& invalidated, SUMOTime tMax, const int group);
+
+    /// @brief split the network into groups for parallel event computation (once, if meso-threads > 0)
+    void initGroups();
+
+    /// @brief the group whose event queue holds the given vehicle's event
+    int getGroup(const MEVehicle* veh) const;
+
     /** @brief Check whether the vehicle may move
      *
      * This method is called when the vehicle reaches its event time and checks
      *  whether it may proceed to the next segment.
+     * Within a parallel group (group >= 0), a vehicle that would enter another group's segment
+     *  or teleport is deferred to the serial part of the step.
      *
      * @param[in] veh The vehicle to check
+     * @param[in] group The group computing the event (-1 if serial)
      */
-    void checkCar(MEVehicle* veh);
+    void checkCar(MEVehicle* veh, const int group);
 
     /** @brief Retrieve next segment
      *
@@ -146,6 +167,7 @@ private:
 
     struct LeaderEvent {
         LeaderEvent(MEVehicle* v);
+        LeaderEvent(MEVehicle* v, long long int index);
 
         SUMOTime time;
         // eventIndex ensures stable sorting of vehicles with the same event time
@@ -168,18 +190,48 @@ private:
         static long long int myEventCounter;
     };
 
-    /// @brief check whether the current car was invalidated and remove it from myInvalidatedLeaderCars
-    bool wasInvalidated(const LeaderEvent& e);
+    /// @brief check whether the current car was invalidated and remove it from the invalidated cars
+    static bool wasInvalidated(const LeaderEvent& e, LeaderEventQeue& invalidated);
 
 
     /// @brief leader cars in the segments sorted by exit time
-    typedef std::priority_queue<LeaderEvent> LeaderEventQeue;
     LeaderEventQeue myLeaderCars;
     LeaderEventQeue myInvalidatedLeaderCars;
 
     /// @brief ranks of the pending events by numerical vehicle id (computed once per saving step)
     mutable std::map<long long int, long long int> myEventIndexCache;
     mutable SUMOTime myEventIndexCacheTime = -1;
+
+    /// @brief a set of junctions (with the edges ending there) whose events are computed by one thread
+    struct Group {
+        LeaderEventQeue leaders;
+        LeaderEventQeue invalidated;
+        long long int eventCounter = 0;
+        SumoRNG* rng = nullptr;
+        /// @brief vehicles to be checked in the serial part of the step
+        std::vector<MEVehicle*> deferred;
+        /// @brief statistics
+        long long int events = 0;
+        double busy = 0;
+    };
+    std::vector<Group> myGroups;
+    /// @brief group by edge numerical id (the group of the edge's end junction)
+    std::vector<int> myEdgeGroups;
+    bool myGroupsInitialized = false;
+    int myThreads = 0;
+    int myRounds = 1;
+    bool myVerbose = false;
+    /// @brief end of the current step (for parallel event computation)
+    SUMOTime myStepEnd = 0;
+
+    /// @brief statistics of the parallel computation
+    double myParallelTime = 0;
+    double mySerialTime = 0;
+    long long int myDeferredCount = 0;
+    long long int myRoundCount = 0;
+
+    class WorkerPool;
+    WorkerPool* myWorkerPool = nullptr;
 
     /// @brief mapping from internal edge ids to their initial segments
     std::vector<MESegment*> myEdges2FirstSegments;

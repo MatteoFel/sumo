@@ -389,6 +389,15 @@ public:
         myLoadedEventIndex = index;
     }
 
+    /// @brief whether the vehicle's event waits for the serial part of a parallel step (see MELoop)
+    bool isDeferred() const {
+        return myAmDeferred;
+    }
+
+    void setDeferred(bool deferred) {
+        myAmDeferred = deferred;
+    }
+
     /// @name state io
     //@{
 
@@ -425,6 +434,9 @@ protected:
 
     /// @brief the order of the vehicle's event among simultaneous events, read from a loaded state (-1 if unset)
     long long int myLoadedEventIndex = -1;
+
+    /// @brief whether the vehicle's event waits for the serial part of a parallel step
+    bool myAmDeferred = false;
 
     /// @brief An instance of a velocity/lane influencing instance; built in "getInfluencer"
     BaseInfluencer* myInfluencer;

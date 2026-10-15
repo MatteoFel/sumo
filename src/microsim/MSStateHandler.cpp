@@ -242,6 +242,14 @@ MSStateHandler::myStartElement(int element, const SUMOSAXAttributes& attrs) {
             MSLane::loadRNGState(index, state);
             break;
         }
+        case SUMO_TAG_RNGMESOGROUP: {
+            const int index = attrs.getInt(SUMO_ATTR_INDEX);
+            const std::string state = attrs.getString(SUMO_ATTR_STATE);
+            if (MSGlobals::gUseMesoSim) {
+                MSGlobals::gMesoNet->loadRNGState(index, state);
+            }
+            break;
+        }
         case SUMO_TAG_EDGECONTROL: {
             bool ok;
             std::list<MSLane*> activeLanes;
@@ -679,6 +687,9 @@ MSStateHandler::saveRNGs(OutputDevice& out) {
     out.writeAttr(SUMO_ATTR_RNG_DRIVERSTATE, RandHelper::saveState(OUProcess::getRNG()));
     out.writeAttr(SUMO_ATTR_RNG_DEVICE_TOC, RandHelper::saveState(MSDevice_ToC::getResponseTimeRNG()));
     MSLane::saveRNGStates(out);
+    if (MSGlobals::gUseMesoSim) {
+        MSGlobals::gMesoNet->saveRNGStates(out);
+    }
     out.closeTag();
 
 }
