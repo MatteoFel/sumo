@@ -111,6 +111,9 @@ public:
     /** Information whether positions will be interpolated */
     static bool gMesoInterpolatePos;
 
+    /// @brief distance before the edge end from which lane queues are chosen by the next edge (negative: whole edge)
+    static double gMesoLaneQueueLookahead;
+
     /// mesoscopic simulation infrastructure
     static MELoop* gMesoNet;
 

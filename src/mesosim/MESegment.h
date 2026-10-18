@@ -624,6 +624,9 @@ protected:
     /// @brief The follower edge to allowed que index mapping for multi queue segments
     std::map<const MSEdge*, int> myFollowerMap;
 
+    /// @brief whether vehicles choose their queue by their next edge (last segment, or within meso-lane-queue.lookahead)
+    bool myChooseQueueByFollower = false;
+
     /// @brief the last headway
     SUMOTime myLastHeadway;
 

@@ -790,6 +790,8 @@ MSFrame::fillOptions() {
     oc.addDescription("meso-multi-queue", "Mesoscopic", TL("Enable multiple queues at edge ends"));
     oc.doRegister("meso-lane-queue", new Option_Bool(false));
     oc.addDescription("meso-lane-queue", "Mesoscopic", TL("Enable separate queues for every lane"));
+    oc.doRegister("meso-lane-queue.lookahead", new Option_Float(0));
+    oc.addDescription("meso-lane-queue.lookahead", "Mesoscopic", TL("With lane queues, vehicles only use lanes leading to their next edge in segments ending within FLOAT m of the edge end (0: last segment only, negative: whole edge)"));
     oc.doRegister("meso-ignore-lanes-by-vclass", new Option_StringVector(StringVector({ "pedestrian", "bicycle" })));
     oc.addDescription("meso-ignore-lanes-by-vclass", "Mesoscopic", TL("Do not build queues (or reduce capacity) for lanes allowing only the given vclasses"));
     oc.addSynonyme("meso-ignore-lanes-by-vclass", "meso.ignore-lanes.by-vclass");
@@ -1206,6 +1208,7 @@ MSFrame::setMSGlobals(OptionsCont& oc) {
     MSGlobals::gUseMesoSim = oc.getBool("mesosim");
     MSGlobals::gMesoLimitedJunctionControl = oc.getBool("meso-junction-control.limited");
     MSGlobals::gMesoInterpolatePos = oc.getBool("meso-interpolate-pos");
+    MSGlobals::gMesoLaneQueueLookahead = oc.getFloat("meso-lane-queue.lookahead");
     MSGlobals::gWaitingTimeMemory = string2time(oc.getString("waiting-time-memory"));
     MSAbstractLaneChangeModel::initGlobalOptions(oc);
     MSGlobals::gOverheadWireSolver = oc.getBool("overhead-wire.solver");

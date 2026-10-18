@@ -55,6 +55,7 @@ bool MSGlobals::gStateLoaded;
 bool MSGlobals::gUseMesoSim;
 bool MSGlobals::gMesoLimitedJunctionControl;
 bool MSGlobals::gMesoInterpolatePos;
+double MSGlobals::gMesoLaneQueueLookahead(0.);
 MELoop* MSGlobals::gMesoNet;
 
 bool MSGlobals::gOverheadWireSolver;
