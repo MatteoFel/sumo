@@ -563,6 +563,11 @@ protected:
      */
     void addDownstreamFollowers(const MSEdge& edge, const std::vector<int>& reach, const double dist, const double lookahead, const int depth);
 
+    /// @brief whether space vacated by vehicles that left the given queue has not yet reached the upstream end
+    virtual bool hasTravelingGaps(int /*qIdx*/, SUMOTime /*time*/) const {
+        return false;
+    }
+
 protected:
     /// @brief The microsim edge this segment belongs to
     const MSEdge& myEdge;
