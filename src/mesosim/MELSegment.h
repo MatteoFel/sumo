@@ -73,6 +73,17 @@ public:
     std::string getQueueExtraState(int qIdx) const override;
     void loadQueueExtraState(int qIdx, const std::string& state, SUMOTime offset) override;
 
+    /** @brief Returns the minimum distance between the segment end and the front of a queued vehicle
+     *
+     * The space vacated by queued vehicles that left the segment only becomes
+     * usable once the start wave has traveled back to the vehicle
+     * @param[in] qIdx The queue of the vehicle
+     * @param[in] lengthAhead The total length (with gaps) of the vehicles ahead in the queue
+     * @param[in] distToEnd The current distance between the vehicle and the segment end
+     * @param[in] time The current time
+     */
+    double getMinDistanceToEnd(int qIdx, double lengthAhead, double distToEnd, SUMOTime time) const override;
+
 protected:
     /// @brief compute current headway depending on traffic state
     SUMOTime computeHeadway(Queue& q, const Queue& qNext, const MESegment* const next, const MEVehicle* veh) const override;
@@ -90,10 +101,20 @@ private:
     /// @brief the length of a segment filled with jammed (default) vehicles
     const double myJamLength;
 
-    /// @brief upstream arrival times of traveling gaps between cars (for each queue)
+    /// @brief space vacated by a vehicle that left the segment and travels upstream
+    struct Gap {
+        /// @brief the time at which the gap reaches the upstream end of the segment
+        SUMOTime arrival;
+        /// @brief the time at which the vehicle left the segment
+        SUMOTime departure;
+        /// @brief whether the vehicle left from a queue (and thus triggered a start wave)
+        bool queued;
+    };
+
+    /// @brief traveling gaps between cars (for each queue), the most recent one first
     // @note: could be slightly faster as a double-index ring-buffer
-    typedef std::vector<SUMOTime> GapTimes;
-    std::vector<GapTimes> myGapTimes;
+    typedef std::vector<Gap> Gaps;
+    std::vector<Gaps> myGaps;
 
 private:
     /// @brief Invalidated copy constructor.
